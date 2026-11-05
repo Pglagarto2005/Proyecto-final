@@ -1,0 +1,771 @@
+
+/*
+============================================================
+ ESP32 - Tanque + Humedad de suelo
+ ThingsBoard Cloud (MQTT) + InfluxDB + Servo + LEDs
+
+ CONTROL:
+ - Humedad < 20%: servo abierto + LED rojo
+ - Humedad >= 100%: servo cerrado + LED verde
+ - ThingsBoard: servo abierto durante 5 segundos
+ - Al terminar: servo vuelve a 0 grados
+ - Bloqueo automatico durante 10 segundos
+============================================================
+*/
+
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+#include <InfluxDbClient.h>
+#include <InfluxDbCloud.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+
+#define WIFI_SSID "CirkitWifi"
+#define WIFI_PASSWORD ""
+
+WiFiMulti wifiMulti;
+
+// ============================================================
+// THINGSBOARD MQTT
+// ============================================================
+
+#define TB_SERVER "thingsboard.cloud"
+#define TB_PORT 1883
+
+// Introduce tu token nuevo de ThingsBoard
+#define TB_TOKEN "TOKEN"
+
+#define TB_CLIENT "esp32_tanque_planta"
+
+#define TOPIC_TELEMETRY "v1/devices/me/telemetry"
+#define TOPIC_RPC_REQ "v1/devices/me/rpc/request/+"
+#define TOPIC_RPC_RESP "v1/devices/me/rpc/response/"
+
+// ============================================================
+// INFLUXDB
+// ============================================================
+
+#define INFLUXDB_URL "https://us-east-1-1.aws.cloud2.influxdata.com"
+#define INFLUXDB_TOKEN "TOKEN"
+#define INFLUXDB_ORG "Clase de computacion fisica"
+#define INFLUXDB_BUCKET "Sprout"
+
+#define TZ_INFO "COT5"
+
+// ============================================================
+// PINES
+// ============================================================
+
+#define PIN_NIVEL 33
+#define PIN_HUMEDAD 32
+#define PIN_SERVO 13
+
+#define LED_VERDE 5
+#define LED_AMARILLO 19
+#define LED_ROJO 18
+
+// ============================================================
+// CALIBRACION
+// ============================================================
+
+#define HUM_SECO_ADC 0
+#define HUM_MOJADO_ADC 3083
+
+#define NIVEL_VACIO_ADC 0
+#define NIVEL_LLENO_ADC 4095
+
+#define MUESTRAS_ADC 8
+
+// ============================================================
+// UMBRALES DE HUMEDAD
+// ============================================================
+
+#define HUMEDAD_SECA 20.0
+#define HUMEDAD_HUMEDA 55.0
+
+// ============================================================
+// NIVEL DEL TANQUE
+// ============================================================
+
+#define NIVEL_ALERTA_ON_RAW 16.84
+#define NIVEL_ALERTA_OFF_RAW 29.18
+
+// ============================================================
+// SERVO
+// ============================================================
+
+#define SERVO_CERRADO 90
+#define SERVO_ABIERTO 180
+
+// Tiempo de apertura manual
+const unsigned long DURACION_SERVO = 5000;
+
+// Tiempo que se bloquea el automatico despues
+// de terminar la accion manual
+const unsigned long BLOQUEO_AUTO_MS = 10000;
+
+// ============================================================
+// INTERVALOS
+// ============================================================
+
+const unsigned long INTERVALO_SENSORES = 200;
+const unsigned long INTERVALO_MQTT = 3000;
+const unsigned long INTERVALO_INFLUX = 10000;
+const unsigned long INTERVALO_RECONNECT = 5000;
+const unsigned long BLINK_MS = 500;
+
+// ============================================================
+// OBJETOS
+// ============================================================
+
+WiFiClient espClient;
+
+PubSubClient mqttClient(espClient);
+
+Servo valvula;
+
+InfluxDBClient influxClient(
+  INFLUXDB_URL,
+  INFLUXDB_ORG,
+  INFLUXDB_BUCKET,
+  INFLUXDB_TOKEN,
+  InfluxDbCloud2CACert
+);
+
+Point punto("tanque_planta");
+
+// ============================================================
+// VARIABLES DE ESTADO
+// ============================================================
+
+// Sensores
+int nivelRaw = 0;
+int humedadRaw = 0;
+
+float nivelPct = 0;
+float humedadPct = 0;
+
+// Estado del tanque
+bool alertaNivel = false;
+
+// Estado del suelo
+bool alertaHumedad = false;
+bool humedadOk = false;
+
+const char* estadoSuelo = "SECO";
+const char* estadoNivel = "NORMAL";
+
+// LED
+bool ledRojoOn = false;
+bool ledAmarilloOn = false;
+bool ledVerdeOn = false;
+
+bool blinkState = false;
+
+// Servo
+bool valvulaAbierta = false;
+
+// Control automatico
+bool demandaHumedad = false;
+
+// Control manual
+bool pulsoManualActivo = false;
+unsigned long inicioPulsoManual = 0;
+
+// Bloqueo del automatico
+bool bloqueoAutomatico = false;
+unsigned long inicioBloqueoAuto = 0;
+
+// Temporizadores
+unsigned long tSensores = 0;
+unsigned long tMqtt = 0;
+unsigned long tInflux = 0;
+unsigned long tReconnect = 0;
+unsigned long tBlink = 0;
+
+// ============================================================
+// CONVERSION ADC A PORCENTAJE
+// ============================================================
+
+float adcAPorcentaje(int raw, int minV, int maxV) {
+
+  if (maxV == minV) return 0;
+
+  float p = (float)(raw - minV) * 100.0 /
+            (float)(maxV - minV);
+
+  return constrain(p, 0.0, 100.0);
+}
+
+// ============================================================
+// LECTURA ADC
+// ============================================================
+
+int leerADC(int pin) {
+
+  long suma = 0;
+
+  for (int i = 0; i < MUESTRAS_ADC; i++) {
+    suma += analogRead(pin);
+  }
+
+  return (int)(suma / MUESTRAS_ADC);
+}
+
+// ============================================================
+// CONTROL DEL SERVO
+// ============================================================
+
+void setValvula(bool abrir) {
+
+  bool cambio = (valvulaAbierta != abrir);
+
+  valvulaAbierta = abrir;
+
+  // Siempre escribe la posicion solicitada
+  valvula.write(abrir ? SERVO_ABIERTO : SERVO_CERRADO);
+
+  if (cambio) {
+
+    Serial.println(
+      abrir ? "SERVO: ABIERTO (180 grados)" :
+              "SERVO: CERRADO (0 grados)"
+    );
+  }
+}
+
+// ============================================================
+// ACTIVACION MANUAL DESDE THINGSBOARD
+// ============================================================
+
+void activarServoManual() {
+
+  // Activa el control manual
+  pulsoManualActivo = true;
+
+  // Reinicia el temporizador
+  inicioPulsoManual = millis();
+
+  // Cancela cualquier bloqueo anterior
+  bloqueoAutomatico = false;
+
+  // Abre el servo
+  setValvula(true);
+
+  Serial.println("--------------------------------");
+  Serial.println("CONTROL MANUAL ACTIVADO");
+  Serial.println("Servo abierto durante 5 segundos");
+  Serial.println("--------------------------------");
+}
+
+// ============================================================
+// TEMPORIZADOR DEL SERVO
+// ============================================================
+
+void actualizarPulsoManual() {
+
+  if (!pulsoManualActivo) return;
+
+  if (millis() - inicioPulsoManual >= DURACION_SERVO) {
+
+    // Finaliza la accion manual
+    pulsoManualActivo = false;
+
+    // CIERRA OBLIGATORIAMENTE EL SERVO
+    setValvula(false);
+
+    // Inicia bloqueo del control automatico
+    bloqueoAutomatico = true;
+    inicioBloqueoAuto = millis();
+
+    Serial.println("--------------------------------");
+    Serial.println("ACCION MANUAL FINALIZADA");
+    Serial.println("Servo regresado a 0 grados");
+    Serial.println("Automatico bloqueado por 10 segundos");
+    Serial.println("--------------------------------");
+  }
+}
+
+// ============================================================
+// CONTROL AUTOMATICO POR HUMEDAD
+// ============================================================
+
+void actualizarControlHumedad() {
+
+  // Actualiza la demanda segun la humedad
+  if (humedadPct < HUMEDAD_SECA) {
+
+    demandaHumedad = true;
+
+  } else if (humedadPct >= HUMEDAD_HUMEDA) {
+
+    demandaHumedad = false;
+  }
+
+  // Si hay una accion manual, no intervenir
+  if (pulsoManualActivo) return;
+
+  // Comprueba el bloqueo automatico
+  if (bloqueoAutomatico) {
+
+    if (millis() - inicioBloqueoAuto < BLOQUEO_AUTO_MS) {
+
+      return;
+
+    } else {
+
+      bloqueoAutomatico = false;
+
+      Serial.println("--------------------------------");
+      Serial.println("BLOQUEO AUTOMATICO FINALIZADO");
+      Serial.println("Recuperando control por humedad");
+      Serial.println("--------------------------------");
+    }
+  }
+
+  // Control automatico normal
+  setValvula(demandaHumedad);
+}
+
+// ============================================================
+// LECTURA DE SENSORES
+// ============================================================
+
+void leerSensores() {
+
+  nivelRaw = leerADC(PIN_NIVEL);
+  humedadRaw = leerADC(PIN_HUMEDAD);
+
+  // Conversion a porcentaje
+  nivelPct = adcAPorcentaje(
+    nivelRaw,
+    NIVEL_VACIO_ADC,
+    NIVEL_LLENO_ADC
+  );
+
+  humedadPct = adcAPorcentaje(
+    humedadRaw,
+    HUM_SECO_ADC,
+    HUM_MOJADO_ADC
+  );
+
+  // ----------------------------------------
+  // NIVEL DEL TANQUE
+  // ----------------------------------------
+
+  if (!alertaNivel && nivelRaw <= NIVEL_ALERTA_ON_RAW) {
+
+    alertaNivel = true;
+
+  } else if (alertaNivel && nivelRaw >= NIVEL_ALERTA_OFF_RAW) {
+
+    alertaNivel = false;
+  }
+
+  estadoNivel = alertaNivel ? "BAJO" : "NORMAL";
+
+  // ----------------------------------------
+  // HUMEDAD
+  // ----------------------------------------
+
+  alertaHumedad = humedadPct < HUMEDAD_SECA;
+
+  humedadOk = humedadPct >= HUMEDAD_HUMEDA;
+
+  if (alertaHumedad) {
+
+    estadoSuelo = "SECO";
+
+  } else if (humedadOk) {
+
+    estadoSuelo = "HUMEDO";
+
+  } else {
+
+    estadoSuelo = "INTERMEDIO";
+  }
+
+  // ----------------------------------------
+  // MONITOR SERIAL
+  // ----------------------------------------
+
+  Serial.printf(
+    "Nivel RAW: %d | Nivel: %.1f%% | Humedad RAW: %d | Humedad: %.1f%%\n",
+    nivelRaw,
+    nivelPct,
+    humedadRaw,
+    humedadPct
+  );
+}
+
+// ============================================================
+// CONTROL DE LED
+// ============================================================
+
+void actualizarLeds() {
+
+  // LED rojo: suelo seco
+  ledRojoOn = humedadPct < HUMEDAD_SECA;
+
+  // LED verde: suelo completamente humedo
+  ledVerdeOn = humedadPct >= HUMEDAD_HUMEDA;
+
+  // LED amarillo: tanque bajo
+  unsigned long now = millis();
+
+  if (now - tBlink >= BLINK_MS) {
+
+    tBlink = now;
+    blinkState = !blinkState;
+  }
+
+  ledAmarilloOn = alertaNivel ? blinkState : false;
+
+  digitalWrite(LED_ROJO, ledRojoOn);
+  digitalWrite(LED_VERDE, ledVerdeOn);
+  digitalWrite(LED_AMARILLO, ledAmarilloOn);
+}
+
+// ============================================================
+// TELEMETRIA THINGSBOARD
+// ============================================================
+
+void publicarTelemetria() {
+
+  StaticJsonDocument<512> doc;
+
+  doc["nivel_raw"] = nivelRaw;
+  doc["humedad_raw"] = humedadRaw;
+
+  doc["nivel_agua"] = nivelPct;
+  doc["humedad_suelo"] = humedadPct;
+
+  doc["estado_suelo"] = estadoSuelo;
+  doc["estado_nivel"] = estadoNivel;
+
+  doc["alerta_nivel"] = alertaNivel;
+  doc["alerta_humedad"] = alertaHumedad;
+
+  doc["valvula"] = valvulaAbierta;
+
+  doc["led_rojo"] = ledRojoOn;
+  doc["led_amarillo"] = ledAmarilloOn;
+  doc["led_verde"] = ledVerdeOn;
+
+  char buffer[512];
+
+  serializeJson(doc, buffer);
+
+  mqttClient.publish(TOPIC_TELEMETRY, buffer);
+
+  Serial.print("TB -> ");
+  Serial.println(buffer);
+}
+
+// ============================================================
+// CALLBACK RPC THINGSBOARD
+// ============================================================
+
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  String t = String(topic);
+
+  String requestId = t.substring(t.lastIndexOf('/') + 1);
+
+  StaticJsonDocument<256> doc;
+
+  if (deserializeJson(doc, payload, length)) {
+
+    Serial.println("RPC: JSON invalido");
+
+    return;
+  }
+
+  String metodo = doc["method"].as<String>();
+
+  Serial.print("RPC recibido: ");
+  Serial.println(metodo);
+
+  String respuesta = "";
+
+  // ----------------------------------------
+  // ACTIVAR SERVO
+  // ----------------------------------------
+
+  if (metodo == "setValve") {
+
+    bool activar = doc["params"].as<bool>();
+
+    if (activar) {
+
+      activarServoManual();
+
+    } else {
+
+      // Cancelacion manual
+      pulsoManualActivo = false;
+
+      // Cierra inmediatamente
+      setValvula(false);
+
+      // Tambien bloquea temporalmente el automatico
+      bloqueoAutomatico = true;
+      inicioBloqueoAuto = millis();
+
+      Serial.println("Accion manual cancelada");
+    }
+
+    respuesta = valvulaAbierta ? "true" : "false";
+  }
+
+  // ----------------------------------------
+  // CONSULTAR SERVO
+  // ----------------------------------------
+
+  else if (metodo == "getValve") {
+
+    respuesta = valvulaAbierta ? "true" : "false";
+  }
+
+  // ----------------------------------------
+  // RESPUESTA RPC
+  // ----------------------------------------
+
+  if (respuesta.length() > 0) {
+
+    String topicResp = String(TOPIC_RPC_RESP) + requestId;
+
+    mqttClient.publish(
+      topicResp.c_str(),
+      respuesta.c_str()
+    );
+  }
+
+  publicarTelemetria();
+}
+
+// ============================================================
+// RECONEXION MQTT
+// ============================================================
+
+void reconnectMQTT() {
+
+  if (mqttClient.connected()) return;
+
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (millis() - tReconnect < INTERVALO_RECONNECT) return;
+
+  tReconnect = millis();
+
+  Serial.print("Conectando a ThingsBoard...");
+
+  if (mqttClient.connect(TB_CLIENT, TB_TOKEN, NULL)) {
+
+    Serial.println("OK");
+
+    mqttClient.subscribe(TOPIC_RPC_REQ);
+
+  } else {
+
+    Serial.print("Falla rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // ----------------------------------------
+  // PINES
+  // ----------------------------------------
+
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AMARILLO, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_ROJO, LOW);
+
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(PIN_NIVEL, ADC_11db);
+  analogSetPinAttenuation(PIN_HUMEDAD, ADC_11db);
+
+  // ----------------------------------------
+  // SERVO
+  // ----------------------------------------
+
+  valvula.setPeriodHertz(50);
+
+  valvula.attach(PIN_SERVO, 500, 2400);
+
+  valvulaAbierta = false;
+
+  setValvula(false);
+
+  // ----------------------------------------
+  // WIFI
+  // ----------------------------------------
+
+  WiFi.mode(WIFI_STA);
+
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Conectando WiFi");
+
+  while (wifiMulti.run() != WL_CONNECTED) {
+
+    Serial.print(".");
+    delay(100);
+  }
+
+  Serial.println();
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // ----------------------------------------
+  // INFLUXDB
+  // ----------------------------------------
+
+  punto.addTag("device", "ESP32");
+
+  timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");
+
+  if (influxClient.validateConnection()) {
+
+    Serial.print("InfluxDB OK: ");
+    Serial.println(influxClient.getServerUrl());
+
+  } else {
+
+    Serial.print("InfluxDB FALLO: ");
+    Serial.println(influxClient.getLastErrorMessage());
+  }
+
+  // ----------------------------------------
+  // MQTT
+  // ----------------------------------------
+
+  mqttClient.setServer(TB_SERVER, TB_PORT);
+
+  mqttClient.setCallback(callback);
+
+  mqttClient.setBufferSize(768);
+
+  Serial.println("--------------------------------");
+  Serial.println("SISTEMA INICIADO");
+  Serial.println("Control manual: 5 segundos");
+  Serial.println("Bloqueo automatico: 10 segundos");
+  Serial.println("--------------------------------");
+}
+
+// ============================================================
+// LOOP PRINCIPAL
+// ============================================================
+
+void loop() {
+
+  // ----------------------------------------
+  // WIFI Y MQTT
+  // ----------------------------------------
+
+  wifiMulti.run();
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    reconnectMQTT();
+
+    if (mqttClient.connected()) {
+
+      mqttClient.loop();
+    }
+  }
+
+  unsigned long now = millis();
+
+  // ----------------------------------------
+  // LECTURA DE SENSORES
+  // ----------------------------------------
+
+  if (now - tSensores >= INTERVALO_SENSORES) {
+
+    tSensores = now;
+
+    leerSensores();
+
+    actualizarControlHumedad();
+  }
+
+  // ----------------------------------------
+  // TEMPORIZADOR MANUAL
+  // ----------------------------------------
+
+  actualizarPulsoManual();
+
+  // ----------------------------------------
+  // LED
+  // ----------------------------------------
+
+  actualizarLeds();
+
+  // ----------------------------------------
+  // TELEMETRIA MQTT
+  // ----------------------------------------
+
+  if (now - tMqtt >= INTERVALO_MQTT &&
+      mqttClient.connected()) {
+
+    tMqtt = now;
+
+    publicarTelemetria();
+  }
+
+  // ----------------------------------------
+  // INFLUXDB
+  // ----------------------------------------
+
+  if (now - tInflux >= INTERVALO_INFLUX &&
+      WiFi.status() == WL_CONNECTED) {
+
+    tInflux = now;
+
+    punto.clearFields();
+
+    punto.addField("nivel_raw", nivelRaw);
+    punto.addField("humedad_raw", humedadRaw);
+
+    punto.addField("nivel_agua", nivelPct);
+    punto.addField("humedad_suelo", humedadPct);
+
+    punto.addField("estado_suelo", estadoSuelo);
+    punto.addField("estado_nivel", estadoNivel);
+
+    punto.addField("alerta_nivel", alertaNivel ? 1 : 0);
+    punto.addField("alerta_humedad", alertaHumedad ? 1 : 0);
+
+    punto.addField("valvula", valvulaAbierta ? 1 : 0);
+
+    Serial.print("Influx -> ");
+    Serial.println(punto.toLineProtocol());
+
+    if (!influxClient.writePoint(punto)) {
+
+      Serial.print("Influx write failed: ");
+
+      Serial.println(influxClient.getLastErrorMessage());
+    }
+  }
+}
